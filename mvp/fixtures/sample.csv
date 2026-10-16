@@ -1,0 +1,7 @@
+ticker,name,asset_class,sector,quantity,price,average_price,currency
+SBER,Сбербанк,stocks,Финансы,300,280,265,RUB
+LKOH,Лукойл,stocks,Нефтегаз,10,6700,7000,RUB
+OFZ-DEMO,Облигации,bonds,Государство,100,980,1000,RUB
+FUND-DEMO,Фонд акций,funds,Широкий рынок,500,105,100,RUB
+GOLD-DEMO,Золото,gold,Драгоценные металлы,20,7000,6300,RUB
+RUB,Рубли,cash,Денежный резерв,58500,1,1,RUB
