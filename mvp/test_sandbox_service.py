@@ -348,6 +348,50 @@ class SandboxServiceTests(unittest.TestCase):
         self.assertTrue(all(sum(card["weights"].values()) == 100 for card in cards))
         self.assertTrue(all(set(card["weights"]) <= {"RUB", "TGLD", "TMOS", "SBER", "LKOH"} for card in cards))
 
+    def gold_preview(self, code):
+        original = self.actor["fake"].preview_order
+        def preview(account_id, instrument_uid, *args, **kwargs):
+            if instrument_uid == "tgld-uid":
+                raise SandboxError(code)
+            return original(account_id, instrument_uid, *args, **kwargs)
+        return patch.object(self.actor["fake"], "preview_order", side_effect=preview)
+
+    def test_closed_gold_fund_does_not_block_the_rest_of_the_basket(self):
+        self.action("connect", {"token": self.actor["secret"]})
+        self.action("create", {"key": str(uuid.uuid4())})
+        with self.gold_preview("TRADING_CLOSED"):
+            proposal = self.demo_preview("balanced")
+        self.assertEqual({row["ticker"] for row in proposal["orders"]}, {"TMOS", "SBER", "LKOH"})
+        self.assertEqual([item["ticker"] for item in proposal["skipped"]], ["TGLD"])
+        self.assertGreater(proposal["skipped"][0]["amount"], 0)
+        self.assertIn("TGLD", proposal["reason"])
+        self.assertIn("остаются в рублях", proposal["reason"])
+        self.confirm(proposal)
+        self.dispatch()
+        self.assertEqual(self.actor["fake"].posts, [proposal["orders"][0]["id"]])
+
+    def test_open_trading_has_no_skipped_instruments(self):
+        proposal = self.demo_ready("balanced")
+        self.assertEqual(proposal["skipped"], [])
+        self.assertEqual({row["ticker"] for row in proposal["orders"]}, {"TGLD", "TMOS", "SBER", "LKOH"})
+
+    def test_basket_with_only_closed_instruments_explains_why_nothing_is_bought(self):
+        self.action("connect", {"token": self.actor["secret"]})
+        self.action("create", {"key": str(uuid.uuid4())})
+        with self.gold_preview("TRADING_CLOSED"):
+            with self.assertRaises(ValidationError) as caught:
+                self.demo_preview("reserve")
+        self.assertIn("TGLD", str(caught.exception))
+        self.assertIsNone(self.public()["proposal"])
+
+    def test_other_unavailable_reasons_still_block_the_basket(self):
+        self.action("connect", {"token": self.actor["secret"]})
+        self.action("create", {"key": str(uuid.uuid4())})
+        with self.gold_preview("UNAVAILABLE"):
+            with self.assertRaises(SandboxError):
+                self.demo_preview("balanced")
+        self.assertIsNone(self.public()["proposal"])
+
     def test_demo_preview_failure_preserves_confirmed_series_and_both_profiles(self):
         self.ready()
         previous = self.propose()

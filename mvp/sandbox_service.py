@@ -501,23 +501,38 @@ class SandboxService:
                 requests = [{"instrument_uid": payload.get("instrument_uid"), "lots": payload.get("lots"), "limit_price": payload.get("limit_price"), "direction": payload.get("direction", "buy")}]
             if not requests:
                 raise ValidationError("Доли в пределах правил или суммы недостаточно для целого лота.")
-            plans = []
+            plans, skipped = [], []
             projected = dict(snapshot)
             projected["positions"] = [dict(p) for p in snapshot["positions"]]
             for request in requests:
-                plan = entry["client"].preview_order(account["id"], request["instrument_uid"], request["lots"], request["limit_price"], request["direction"], quote_policy=policy["quote_policy"])
+                try:
+                    plan = entry["client"].preview_order(account["id"], request["instrument_uid"], request["lots"], request["limit_price"], request["direction"], quote_policy=policy["quote_policy"])
+                except SandboxError as exc:
+                    if not rebalance or exc.code != "TRADING_CLOSED":
+                        raise
+                    # Закрытые торги по одной бумаге не должны блокировать всю корзину:
+                    # сумма остаётся в рублях и показывается пользователю до подтверждения.
+                    skipped.append({"ticker": request.get("ticker"), "name": request.get("name"), "direction": request["direction"],
+                                    "amount": round(float(Decimal(str(request["limit_price"])) * Decimal(str(request.get("quantity", 0)))), 2),
+                                    "reason": "Торги по инструменту сейчас закрыты. Сумма остаётся в рублях; пересчитайте покупки, когда торги откроются."})
+                    continue
                 self.check_allocation(policy, projected, plan)
                 plan["id"] = str(uuid.uuid4())
                 plans.append(plan)
                 if plan["direction"] == "buy":
                     projected["cash"] -= plan["estimated_total"]
+            if not plans:
+                names = ", ".join(item["ticker"] or "?" for item in skipped)
+                raise ValidationError("Торги по бумагам (" + names + ") сейчас закрыты, покупать пока нечего. Повторите расчёт, когда торги откроются.")
             total = round(sum(p["estimated_total"] for p in plans), 2)
+            skip_note = (" Не куплено из-за закрытых торгов: " + "; ".join(f"{s['ticker']} (≈ {s['amount']:,.0f} ₽ остаются в рублях)".replace(",", " ") for s in skipped) + ". Когда торги откроются, пересчитайте покупки.") if skipped else ""
             is_demo = policy.get("mode") == "demo"
             proposal = {"id": str(uuid.uuid4()), "account_id": account["id"], "policy_id": policy["id"], "profile_version": None if is_demo else data["profile_version"],
                         "orders": plans, "total": total, "commission": round(sum(p["commission"] for p in plans), 2), "commission_status": "known",
                         "reserve": policy["cash_reserve_percent"], "kind": "rebalance" if rebalance else "order", "created_at": now(),
                         "expires_at": datetime.fromtimestamp(time.time() + 600, timezone.utc).isoformat(timespec="seconds"),
-                        "quote_policy": policy["quote_policy"], "reason": "Приведение к долям стратегии «" + policy["name"] + "»." if rebalance else "Операция в пределах подтверждённых правил.",
+                        "quote_policy": policy["quote_policy"], "skipped": skipped,
+                        "reason": "Приведение к долям стратегии «" + policy["name"] + "»." + skip_note if rebalance else "Операция в пределах подтверждённых правил.",
                         "source_snapshot": snapshot, "policy": policy, "profile": None if is_demo else self.profile(user, data),
                         "mode": "demo" if is_demo else "profile", "demo_config": data["demo_config"] if is_demo else None,
                         "config_version": data["demo_config_version"] if is_demo else None}

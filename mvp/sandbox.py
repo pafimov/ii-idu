@@ -34,6 +34,7 @@ MESSAGES = {
     "INSUFFICIENT_CASH": "Свободных рублей недостаточно с учетом запаса на расходы.",
     "INSUFFICIENT_POSITION": "Недостаточно свободных бумаг. Продажа в долг запрещена.",
     "UNAVAILABLE": "Инструмент сейчас недоступен для этого действия в песочнице.",
+    "TRADING_CLOSED": "Торги по инструменту сейчас закрыты: лимитная заявка не принимается.",
     "UNAUTHORIZED": "Токен не принят песочницей. Проверьте токен и срок его действия.",
     "FORBIDDEN": "Песочница запретила запрос. Проверьте права токена.",
     "NOT_FOUND": "Счет или заявка в песочнице не найдены. Обновите данные.",
@@ -382,8 +383,10 @@ class SandboxClient:
         if price % Decimal(str(instrument["tick_size"])):
             raise SandboxError("INVALID_ORDER", "Цена должна быть кратна шагу цены инструмента.")
         status = self._call("MarketDataService/GetTradingStatus", {"instrumentId": instrument_uid})
-        if status.get("instrumentUid") != instrument_uid or status.get("apiTradeAvailableFlag") is not True or status.get("limitOrderAvailableFlag") is not True:
+        if status.get("instrumentUid") != instrument_uid:
             raise SandboxError("UNAVAILABLE", "Выставление лимитных заявок сейчас недоступно.")
+        if status.get("apiTradeAvailableFlag") is not True or status.get("limitOrderAvailableFlag") is not True:
+            raise SandboxError("TRADING_CLOSED", "Выставление лимитных заявок сейчас недоступно.")
         book = self._call("MarketDataService/GetOrderBook", {"instrumentId": instrument_uid, "depth": 1})
         if book.get("instrumentUid") != instrument_uid or str(book.get("priceCurrency", "")).upper() != "RUB":
             raise SandboxError("INVALID_RESPONSE")

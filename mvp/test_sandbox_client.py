@@ -231,7 +231,8 @@ class SandboxTests(unittest.TestCase):
 
     def test_api_trading_status_and_bounds_are_checked(self):
         self.transport.trading_available = False
-        self.assert_error("UNAVAILABLE", lambda: self.client.preview_order(ACCOUNT, "sber-uid", 1, 100))
+        error = self.assert_error("TRADING_CLOSED", lambda: self.client.preview_order(ACCOUNT, "sber-uid", 1, 100))
+        self.assertIn("Торги по инструменту сейчас закрыты", str(error))
         self.transport.trading_available = True
         self.assert_error("INVALID_ORDER", lambda: self.client.preview_order(ACCOUNT, "sber-uid", 1, 10001))
         self.client = SandboxClient(TOKEN, self.transport)
