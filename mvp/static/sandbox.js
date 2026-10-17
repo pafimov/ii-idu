@@ -127,7 +127,7 @@ function sandboxSkippedNotice(proposal) {
     const ticker=String(item.ticker||'').replace(/@$/,''), asset=sandboxAssets[ticker] || {};
     return `<li><b>${esc(asset.name || item.name || ticker)}</b> (${esc(ticker)}) — ${money(item.amount)} остаются в рублях</li>`;
   }).join('');
-  return `<div class="sb-skipped" role="note" style="margin:0 0 16px;padding:12px 16px;border-radius:12px;background:#f6efdc;color:#4a3d16"><b>Часть покупок пока недоступна: торги по бумаге закрыты.</b><ul style="margin:6px 0 0;padding-left:18px">${rows}</ul><small>Остальные бумаги можно купить сейчас. Когда торги откроются, нажмите «Изменить выбор» и рассчитайте покупки заново.</small></div>`;
+  return `<div class="sb-skipped" role="note" style="margin:0 0 16px;padding:12px 16px;border-radius:12px;background:#f6efdc;color:#4a3d16"><b>Часть покупок пока недоступна: торги по бумаге закрыты.</b><ul style="margin:6px 0 0;padding-left:18px">${rows}</ul><small>Сумму не перераспределяем в другие активы. После открытия торгов можно пересчитать оставшиеся покупки. Автоматически они не отправятся.</small></div>`;
 }
 function sandboxReview(proposal) {
   const cfg=state.sandbox.demo_config || sandboxConfig();
@@ -142,9 +142,10 @@ function sandboxExecution(proposal) {
   const active=orders.some(o=>sandboxActiveStatuses.has(o.status));
   const allFilled=orders.length>0 && filled===orders.length;
   const reconciled=allFilled && s.snapshot_reconciled===true;
-  const title=reconciled?'Портфель собран.':allFilled?'Покупки исполнены. Сверяем портфель.':active?'Собираем ваш портфель.':'Проверим результат покупок.';
+  const partial=Boolean(proposal.skipped?.length);
+  const title=reconciled?(partial?'Доступные активы куплены.':'Портфель собран.'):allFilled?'Покупки исполнены. Сверяем портфель.':active?'Собираем ваш портфель.':'Проверим результат покупок.';
   const goal=s.demo_config || sandboxConfig();
-  return `<section class="sb-execution" id="sandbox-execution"><div class="sb-result-hero ${reconciled?'complete':''}"><span class="sb-result-icon">${reconciled?icon('check'):icon('wallet')}</span><div><span class="eyebrow">${reconciled?'Всё на своих местах':'Т-Инвестиции'}</span><h2>${title}</h2><p>Исполнено ${filled} из ${orders.length}${reconciled?' · позиции сверены':''}</p></div>${reconciled?'<span class="sb-complete-badge">Готово</span>':'<span class="sb-live-dot"></span>'}</div><div class="sb-execution-track">${orders.map(o=>`<div class="sb-order-state ${o.status==='filled'?'filled':''}"><span class="sb-order-state-icon">${o.status==='filled'?icon('check'):'<i></i>'}</span><b>${esc(String(o.ticker||'').replace(/@$/,''))}</b><span>${sandboxStatusNames[o.status] || 'Проверяем'}</span>${o.error?`<small>${esc(o.error)}</small>`:''}</div>`).join('')}</div>${s.reconcile_error?`<div class="sb-inline-error">${esc(s.reconcile_error)}</div>`:''}${reconciled?sandboxResult(goal):`<p class="sb-wait-note">${active?'Статусы обновляются автоматически. Заявки исполняются, когда достигается лимитная цена.':'Обновите счёт, чтобы получить подтверждённые позиции.'}</p><button type="button" class="btn secondary" data-action="sandbox-refresh">Обновить счёт</button>`}</section>`;
+  return `<section class="sb-execution" id="sandbox-execution"><div class="sb-result-hero ${reconciled?'complete':''}"><span class="sb-result-icon">${reconciled?icon('check'):icon('wallet')}</span><div><span class="eyebrow">${reconciled?(partial?'Покупки подтверждены':'Всё на своих местах'):'Т-Инвестиции'}</span><h2>${title}</h2><p>Исполнено ${filled} из ${orders.length}${reconciled?' · позиции сверены':''}</p></div>${reconciled?`<span class="sb-complete-badge">${partial?'Часть портфеля':'Готово'}</span>`:'<span class="sb-live-dot"></span>'}</div>${sandboxSkippedNotice(proposal)}${reconciled && partial?'<button type="button" class="btn secondary" data-action="sandbox-retry">Пересчитать оставшиеся покупки</button>':''}<div class="sb-execution-track">${orders.map(o=>`<div class="sb-order-state ${o.status==='filled'?'filled':''}"><span class="sb-order-state-icon">${o.status==='filled'?icon('check'):'<i></i>'}</span><b>${esc(String(o.ticker||'').replace(/@$/,''))}</b><span>${sandboxStatusNames[o.status] || 'Проверяем'}</span>${o.error?`<small>${esc(o.error)}</small>`:''}</div>`).join('')}</div>${s.reconcile_error?`<div class="sb-inline-error">${esc(s.reconcile_error)}</div>`:''}${reconciled?sandboxResult(goal):`<p class="sb-wait-note">${active?'Статусы обновляются автоматически. Заявки исполняются, когда достигается лимитная цена.':'Обновите счёт, чтобы получить подтверждённые позиции.'}</p><button type="button" class="btn secondary" data-action="sandbox-refresh">Обновить счёт</button>${!active?'<button type="button" class="btn secondary" data-action="sandbox-retry">Пересчитать покупки</button>':''}`}</section>`;
 }
 function sandboxResult(goal) {
   const s=state.sandbox, snapshot=s.snapshot || {}, total=Number(snapshot.total_value||0);
@@ -225,6 +226,14 @@ async function sandboxAction(action,target) {
   if (action==='sandbox-reset') {
     if (!state.sandbox?.connection?.connected) {sandboxError='Подключите токен песочницы, чтобы создать новый счёт.';render();document.querySelector('#sandbox-token')?.focus();return;}
     sandboxResetDialog();return;
+  }
+  if (action==='sandbox-retry') {
+    if (sandboxHasActiveOrders()) return;
+    if (!state.sandbox?.connection?.connected) {sandboxError='Подключите токен песочницы, чтобы пересчитать покупки.';render();document.querySelector('#sandbox-token')?.focus();return;}
+    sandboxEditing=false;sandboxProgress='Проверяем доступность и пересчитываем покупки';render();
+    const next=await sandboxMutate('demo-preview',{...sandboxConfig()},target);
+    if (next) document.querySelector('#sandbox-review')?.scrollIntoView({block:'start',behavior:'smooth'});
+    return;
   }
   if (action==='sandbox-refresh') return sandboxMutate('refresh',{},target);
   if (action==='sandbox-disconnect') return sandboxMutate('disconnect',{},target);

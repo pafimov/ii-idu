@@ -30,6 +30,7 @@ python3 mvp/app.py
 - [Инструкция и устройство приложения](mvp/README.md)
 - [Архитектура и границы модулей](mvp/docs/ARCHITECTURE.md)
 - [Пользовательский путь](mvp/docs/CJM.md)
+- [Сценарий показа 17 октября](mvp/docs/DEMO.md)
 - [Соответствие требованиям](mvp/docs/REQUIREMENTS.md)
 - [Проверки](mvp/docs/VERIFICATION.md)
 - [PRD, SRS, User Stories и RTM](output/requirements/)

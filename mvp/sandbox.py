@@ -385,8 +385,10 @@ class SandboxClient:
         status = self._call("MarketDataService/GetTradingStatus", {"instrumentId": instrument_uid})
         if status.get("instrumentUid") != instrument_uid:
             raise SandboxError("UNAVAILABLE", "Выставление лимитных заявок сейчас недоступно.")
+        if status.get("apiTradeAvailableFlag") is True and status.get("limitOrderAvailableFlag") is False and status.get("tradingStatus") == "SECURITY_TRADING_STATUS_NOT_AVAILABLE_FOR_TRADING":
+            raise SandboxError("TRADING_CLOSED", instrument["ticker"] + ": пересчитайте покупки после открытия торгов.")
         if status.get("apiTradeAvailableFlag") is not True or status.get("limitOrderAvailableFlag") is not True:
-            raise SandboxError("TRADING_CLOSED", "Выставление лимитных заявок сейчас недоступно.")
+            raise SandboxError("UNAVAILABLE", instrument["ticker"] + ": лимитные заявки сейчас недоступны.")
         book = self._call("MarketDataService/GetOrderBook", {"instrumentId": instrument_uid, "depth": 1})
         if book.get("instrumentUid") != instrument_uid or str(book.get("priceCurrency", "")).upper() != "RUB":
             raise SandboxError("INVALID_RESPONSE")

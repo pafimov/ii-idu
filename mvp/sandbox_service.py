@@ -508,10 +508,8 @@ class SandboxService:
                 try:
                     plan = entry["client"].preview_order(account["id"], request["instrument_uid"], request["lots"], request["limit_price"], request["direction"], quote_policy=policy["quote_policy"])
                 except SandboxError as exc:
-                    if not rebalance or exc.code != "TRADING_CLOSED":
+                    if demo_config is None or not rebalance or request["direction"] != "buy" or exc.code != "TRADING_CLOSED":
                         raise
-                    # Закрытые торги по одной бумаге не должны блокировать всю корзину:
-                    # сумма остаётся в рублях и показывается пользователю до подтверждения.
                     skipped.append({"ticker": request.get("ticker"), "name": request.get("name"), "direction": request["direction"],
                                     "amount": round(float(Decimal(str(request["limit_price"])) * Decimal(str(request.get("quantity", 0)))), 2),
                                     "reason": "Торги по инструменту сейчас закрыты. Сумма остаётся в рублях; пересчитайте покупки, когда торги откроются."})

@@ -231,13 +231,32 @@ class SandboxTests(unittest.TestCase):
 
     def test_api_trading_status_and_bounds_are_checked(self):
         self.transport.trading_available = False
-        error = self.assert_error("TRADING_CLOSED", lambda: self.client.preview_order(ACCOUNT, "sber-uid", 1, 100))
-        self.assertIn("Торги по инструменту сейчас закрыты", str(error))
+        self.assert_error("UNAVAILABLE", lambda: self.client.preview_order(ACCOUNT, "sber-uid", 1, 100))
         self.transport.trading_available = True
         self.assert_error("INVALID_ORDER", lambda: self.client.preview_order(ACCOUNT, "sber-uid", 1, 10001))
         self.client = SandboxClient(TOKEN, self.transport)
         self.transport.buy_available = False
         self.assert_error("UNAVAILABLE", lambda: self.client.preview_order(ACCOUNT, "sber-uid", 1, 100))
+
+    def test_only_confirmed_closed_status_can_be_skipped(self):
+        original = self.transport.__call__
+        status = {"instrumentUid": "sber-uid", "apiTradeAvailableFlag": True,
+                  "limitOrderAvailableFlag": False, "tradingStatus": "SECURITY_TRADING_STATUS_NOT_AVAILABLE_FOR_TRADING"}
+        def transport(method, payload):
+            return dict(status) if method == "MarketDataService/GetTradingStatus" else original(method, payload)
+        client = SandboxClient(TOKEN, transport)
+        error = self.assert_error("TRADING_CLOSED", lambda: client.preview_order(ACCOUNT, "sber-uid", 1, 100))
+        self.assertIn("SBER", str(error))
+        for field, value in (("instrumentUid", "other-uid"), ("apiTradeAvailableFlag", False),
+                             ("apiTradeAvailableFlag", None), ("limitOrderAvailableFlag", None),
+                             ("tradingStatus", "SECURITY_TRADING_STATUS_UNSPECIFIED"), ("tradingStatus", "SECURITY_TRADING_STATUS_SESSION_CLOSE"),
+                             ("tradingStatus", "SECURITY_TRADING_STATUS_DEALER_NOT_AVAILABLE_FOR_TRADING"), ("tradingStatus", None)):
+            with self.subTest(field=field, value=value):
+                previous = status[field]
+                status[field] = value
+                self.assert_error("UNAVAILABLE", lambda: client.preview_order(ACCOUNT, "sber-uid", 1, 100))
+                status[field] = previous
+        self.assertFalse(any(method.startswith("SandboxService/") for method, _ in self.transport.calls))
 
     def test_post_order_is_limit_with_saved_uuid_and_never_retries(self):
         plan = self.client.preview_order(ACCOUNT, "sber-uid", 2, 100)

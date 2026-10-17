@@ -370,6 +370,65 @@ class SandboxServiceTests(unittest.TestCase):
         self.dispatch()
         self.assertEqual(self.actor["fake"].posts, [proposal["orders"][0]["id"]])
 
+    def test_partial_purchase_reopens_on_same_account_with_new_consent(self):
+        fake = self.actor["fake"]
+        self.action("connect", {"token": self.actor["secret"]})
+        self.action("create", {"key": str(uuid.uuid4())})
+        with self.gold_preview("TRADING_CLOSED"):
+            proposal = self.demo_preview()
+            self.confirm(proposal)
+            for order in proposal["orders"]:
+                self.dispatch()
+                fake.fill(order["id"])
+                self.action("refresh")
+            self.assertTrue(self.public()["snapshot_reconciled"])
+            self.assertEqual(len(fake.positions), 3)
+            self.assertGreater(fake.cash, 6_000_000)
+            with self.assertRaises(ValidationError):
+                self.demo_preview()
+            self.assertEqual(self.public()["proposal"]["id"], proposal["id"])
+        reopened = self.demo_preview()
+        self.assertEqual([o["ticker"] for o in reopened["orders"]], ["TGLD"])
+        self.assertEqual(reopened["skipped"], [])
+        self.assertEqual(reopened["account_id"], proposal["account_id"])
+        self.dispatch()
+        self.assertEqual(len(fake.posts), 3)
+        with self.assertRaises(ValidationError):
+            self.confirm(proposal)
+        self.confirm(reopened)
+        self.dispatch()
+        fake.fill(reopened["orders"][0]["id"])
+        self.action("refresh")
+        self.assertEqual(len(fake.positions), 4)
+        self.assertEqual(fake.open_calls, 1)
+        self.assertEqual(fake.payments, [10_000_000])
+        self.assertTrue(self.public()["snapshot_reconciled"])
+
+    def test_legacy_profile_and_closed_sales_are_not_skipped(self):
+        self.ready()
+        with self.gold_preview("TRADING_CLOSED"):
+            with self.assertRaises(SandboxError):
+                self.propose(rebalance=True)
+        self.assertIsNone(self.public()["demo_config"])
+        fake = self.actor["fake"]
+        gold = next(row for row in fake.catalog_rows if row["ticker"] == "TGLD")
+        fake.positions = [{**gold, "quantity": 50_000, "currency": "RUB", "blocked": False, "available_quantity": 50_000}]
+        fake.cash = 5_000_000
+        with self.gold_preview("TRADING_CLOSED"):
+            with self.assertRaises(SandboxError):
+                self.demo_preview()
+        self.assertIsNone(self.public()["demo_config"])
+        self.assertEqual(fake.posts, [])
+
+    def test_closing_after_consent_does_not_silently_change_the_series(self):
+        proposal = self.demo_ready()
+        self.confirm(proposal)
+        with self.gold_preview("TRADING_CLOSED"):
+            with self.assertRaises(SandboxError):
+                self.dispatch()
+        self.assertEqual(self.actor["fake"].posts, [])
+        self.assertFalse(any(o["status"] == "draft" for o in self.public()["orders"]))
+
     def test_open_trading_has_no_skipped_instruments(self):
         proposal = self.demo_ready("balanced")
         self.assertEqual(proposal["skipped"], [])
