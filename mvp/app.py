@@ -165,7 +165,7 @@ class AppServer(ThreadingHTTPServer):
         init_database(self.database)
         super().__init__(address, Handler)
         self.brokers = BrokerSessions()
-        self.sandboxes = BrokerSessions()
+        self.sandboxes = BrokerSessions(idle_seconds=None, max_seconds=None)
         self.sandbox_service = SandboxService(self.database, self.sandboxes, sandbox_factory, sandbox_worker)
 
     def server_close(self):
@@ -331,7 +331,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(405, "Метод не поддерживается.")
                 return self.serve_static(path)
             if self.command == "GET" and path == "/api/health":
-                return self.send_json(200, {"status": "ok", "version": "0.4.1", "sandbox_worker": self.server.sandbox_service.worker.is_alive()})
+                return self.send_json(200, {"status": "ok", "version": "0.4.2", "sandbox_worker": self.server.sandbox_service.worker.is_alive()})
             if self.command == "GET" and path == "/api/sample.csv":
                 return self.send_bytes(200, (ROOT / "fixtures" / "sample.csv").read_bytes(), "text/csv; charset=utf-8", "portfolio-sample.csv")
             data = self.read_json() if self.command != "GET" else {}

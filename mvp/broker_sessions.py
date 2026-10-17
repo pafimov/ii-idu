@@ -27,7 +27,9 @@ class BrokerSessions:
     def purge(self):
         now = self.clock()
         for key, entry in list(self.connections.items()):
-            if now >= entry["created_at"] + self.max_seconds or now >= entry["used_at"] + self.idle_seconds:
+            expired = self.max_seconds is not None and now >= entry["created_at"] + self.max_seconds
+            idle = self.idle_seconds is not None and now >= entry["used_at"] + self.idle_seconds
+            if expired or idle:
                 del self.connections[key]
 
     def prepare(self, owner, key, client):
@@ -48,7 +50,7 @@ class BrokerSessions:
         self.purge()
         entry = self.connections.get(key)
         if not entry or entry["owner"] != owner:
-            raise BrokerSessionError("Подключение завершено. Подключите токен только для чтения заново.")
+            raise BrokerSessionError("Подключение завершено. Подключите токен заново.")
         return entry
 
     @contextmanager
@@ -108,12 +110,12 @@ class BrokerSessions:
                 entry = self.current(owner, key)
             except BrokerSessionError:
                 return {"connected": False, "accounts": [], "account_id": None, "read_only": True}
-            deadline = min(entry["created_at"] + self.max_seconds, entry["used_at"] + self.idle_seconds)
+            deadlines = [entry[field] + duration for field, duration in (("created_at", self.max_seconds), ("used_at", self.idle_seconds)) if duration is not None]
             return {"connected": entry["ready"], "connecting": not entry["ready"],
                     "busy": entry["busy"], "read_only": True,
                     "accounts": [dict(account) for account in entry["accounts"]],
                     "account_id": entry["account_id"], "account_name": entry["account_name"],
-                    "expires_at": datetime.fromtimestamp(deadline, timezone.utc).isoformat(timespec="seconds"),
+                    "expires_at": datetime.fromtimestamp(min(deadlines), timezone.utc).isoformat(timespec="seconds") if deadlines else None,
                     "last_error": entry["last_error"]}
 
     def close(self):

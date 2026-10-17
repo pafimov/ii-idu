@@ -46,7 +46,7 @@ LLM может появиться над профилем и объяснени�
 | `sandbox_store.py` | Транзакции SQLite, состояния, предложения, intents, actions и audit | Репозиторий PostgreSQL, миграции, ограничения/индексы, защищённое audit storage и retention |
 | `sandbox.py` | Фиксированный sandbox host, allowlist, каталог, котировки, комиссии, лимитные заявки, статусы/отмена | Contract tests нового adapter с platform owner; sandbox не переключается в production настройкой |
 | `tinvest.py` | RUB/long read-only портфель, НКД, сверка типов и количеств | Отдельный data contract и допустимый universe |
-| `broker_sessions.py` | Два раздельных RAM vault, owner/session binding, idle 30 мин / max 8 ч | Утверждённые entitlement/revocation и secret-management contract |
+| `broker_sessions.py` | Два раздельных RAM vault с owner/session binding; sandbox — до отключения/выхода/завершения процесса, read-only — idle 30 мин / max 8 ч | Утверждённые entitlement/revocation и secret-management contract |
 | `static/` | Формы и отображение подтверждённых состояний | UI не является источником торговых полномочий |
 
 Один процесс и SQLite выбраны для понятного запуска и проверки инвариантов. Разделение по ответственности позволяет заменить transport, repository и broker adapter отдельно. Микросервисы пока добавили бы эксплуатацию без подтверждённой потребности.

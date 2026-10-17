@@ -201,6 +201,36 @@ class BrokerApiTests(unittest.TestCase):
 
 
 class BrokerMemoryTests(unittest.TestCase):
+    def test_process_lifetime_connection_keeps_owner_and_revocation_checks(self):
+        current_time = [1000]
+        memory = BrokerSessions(clock=lambda: current_time[0], idle_seconds=None, max_seconds=None)
+        try:
+            first = memory.prepare("owner", "session", object())
+            first.update(ready=True, busy=False)
+            current_time[0] += 365 * 24 * 60 * 60
+            status = memory.status("owner", "session")
+            self.assertTrue(status["connected"])
+            self.assertIsNone(status["expires_at"])
+            self.assertFalse(memory.status("other-owner", "session")["connected"])
+            with self.assertRaises(BrokerSessionError):
+                memory.begin("other-owner", "session")
+            with memory.send_guard(first):
+                pass
+            second = memory.prepare("owner", "session", object())
+            second.update(ready=True, busy=False)
+            with self.assertRaises(BrokerSessionError):
+                with memory.accept(first):
+                    self.fail("Replaced connection accepted")
+            memory.disconnect("owner", "session")
+            self.assertFalse(memory.status("owner", "session")["connected"])
+            with self.assertRaises(BrokerSessionError):
+                with memory.send_guard(second):
+                    self.fail("Disconnected connection accepted")
+            memory.prepare("owner", "session", object())
+        finally:
+            memory.close()
+        self.assertFalse(memory.connections)
+
     def test_idle_and_hard_expiry_and_stale_identity(self):
         current_time = [1000]
         memory = BrokerSessions(clock=lambda: current_time[0], idle_seconds=30, max_seconds=80)

@@ -83,6 +83,12 @@ class ApiTests(unittest.TestCase):
     def execute(self, proposal, key=None):
         return self.client.post("/api/paper/execute", {"proposal_id": proposal["id"], "consent": True, "idempotency_key": key or str(uuid.uuid4())})
 
+    def test_only_sandbox_connections_have_no_time_limit(self):
+        self.assertIsNone(self.server.sandboxes.idle_seconds)
+        self.assertIsNone(self.server.sandboxes.max_seconds)
+        self.assertEqual(self.server.brokers.idle_seconds, 1800)
+        self.assertEqual(self.server.brokers.max_seconds, 28800)
+
     def test_registration_login_logout_and_session_hash(self):
         self.assertEqual(self.client.request("GET", "/api/state")[0], 401)
         email, state, headers = self.register()
