@@ -12,13 +12,14 @@ from decimal import Decimal
 
 from broker_sessions import BrokerSessionError
 from engine import ValidationError, validate_profile
-from portfolio_policy import demo_strategies, insights, make_demo_policy, make_policy, rebalance_orders, strategies, validate_demo_config
+from portfolio_policy import STRATEGY_VERSION, demo_strategies, insights, make_demo_policy, make_policy, rebalance_orders, strategies, validate_demo_config
 from sandbox import SandboxError
 from sandbox_store import SandboxConflict, SandboxStore, encode, now
 
 
 TERMINAL = {"filled", "cancelled", "rejected", "blocked"}
 ACTIVE = {"submitting", "new", "partially_filled", "unknown"}
+PENDING = {"draft", "waiting_market"}
 
 
 class SandboxService:
@@ -95,9 +96,15 @@ class SandboxService:
         if conn.execute("SELECT 1 FROM sandbox_actions WHERE user_id=? AND status IN ('opening','funding','unknown','resetting')", (owner,)).fetchone():
             raise SandboxConflict("Результат создания или пополнения ещё уточняется. Заявки пока недоступны; повторное пополнение не отправлено.")
 
+    @staticmethod
+    def require_consent(conn, owner, key, proposal_id):
+        consent = conn.execute("SELECT * FROM sandbox_consents WHERE proposal_id=? AND user_id=?", (proposal_id, owner)).fetchone()
+        if not consent or consent["session_hash"] != key or consent["expires_at"] <= time.time():
+            raise SandboxConflict("Согласие этой сессии завершено. Рассчитайте и подтвердите покупки заново.")
+
     def invalidate(self, conn, owner, data, reason):
         conn.execute("UPDATE sandbox_proposals SET revoked=1 WHERE user_id=?", (owner,))
-        conn.execute("UPDATE sandbox_orders SET status='cancelled' WHERE user_id=? AND status='draft'", (owner,))
+        conn.execute("UPDATE sandbox_orders SET status='cancelled' WHERE user_id=? AND status IN ('draft','waiting_market')", (owner,))
         data.update(proposal_id=None, version=data["version"] + 1)
         self.store.audit(conn, owner, reason, {"account": data["account"], "version": data["version"]})
 
@@ -239,7 +246,7 @@ class SandboxService:
                 with self.store.transaction() as conn, self.vault.accept(entry):
                     self.store.authenticate(conn, owner, key)
                     data = self.store.load(conn, owner)
-                    if any(order["status"] in ACTIVE for order in self.store.orders(conn, owner)):
+                    if any(order["status"] in ACTIVE or order["status"] == "waiting_market" for order in self.store.orders(conn, owner)):
                         raise SandboxConflict("Сначала нужно уточнить результат активных заявок.")
                     if conn.execute("SELECT 1 FROM sandbox_actions WHERE user_id=? AND status IN ('opening','funding','unknown','resetting')", (owner,)).fetchone():
                         raise SandboxConflict("Результат создания или пополнения ещё уточняется. Новый счёт не создан.")
@@ -331,7 +338,7 @@ class SandboxService:
                     self.refresh_pending.setdefault((owner, key), 3)
                 if result.get("status") in ("cancelled", "rejected"):
                     conn.execute("UPDATE sandbox_proposals SET revoked=1 WHERE id=?", (order["proposal_id"],))
-                    conn.execute("UPDATE sandbox_orders SET status='cancelled' WHERE proposal_id=? AND status='draft'", (order["proposal_id"],))
+                    conn.execute("UPDATE sandbox_orders SET status='cancelled' WHERE proposal_id=? AND status IN ('draft','waiting_market')", (order["proposal_id"],))
             if valid is False:
                 raise SandboxError("RECONCILIATION", "Реквизиты результата заявки не совпали.")
 
@@ -383,6 +390,8 @@ class SandboxService:
         policy = data.get("policy")
         if not policy:
             raise ValidationError("Сначала выберите и подтвердите правила портфеля.")
+        if policy.get("basket_version") != STRATEGY_VERSION:
+            raise ValidationError("Состав стратегии обновлён. Рассчитайте покупки и подтвердите новое предложение.")
         if policy.get("mode") == "demo":
             if not data.get("demo_config") or policy.get("config_version") != data["demo_config_version"] or policy.get("demo_config") != data["demo_config"]:
                 raise ValidationError("Настройки демонстрации изменились. Рассчитайте предложение заново.")
@@ -446,9 +455,11 @@ class SandboxService:
                 if proposal["confirmed_at"]:
                     return
                 conn.execute("UPDATE sandbox_proposals SET confirmed_at=? WHERE id=?", (now(), proposal["id"]))
+                conn.execute("INSERT INTO sandbox_consents VALUES(?,?,?,?)", (proposal["id"], owner, key, proposal["expires_at"]))
                 for sequence, original in enumerate(plan["orders"]):
                     order = {**original, "sequence": sequence}
-                    conn.execute("INSERT INTO sandbox_orders VALUES(?,?,?,?,?,'draft',?)", (order["id"], owner, proposal["id"], data["account"]["id"], encode(order), now()))
+                    status = "waiting_market" if order.get("waiting_market") else "draft"
+                    conn.execute("INSERT INTO sandbox_orders VALUES(?,?,?,?,?,?,?)", (order["id"], owner, proposal["id"], data["account"]["id"], encode(order), status, now()))
                 self.store.audit(conn, owner, "series_confirmed", {"proposal": plan, "profile": self.profile(user, data), "policy": policy})
             self.store.save(conn, owner, data)
         self.wake.set()
@@ -488,7 +499,7 @@ class SandboxService:
             with self.store.transaction() as conn:
                 self.require_settled_actions(conn, owner)
                 existing = self.store.orders(conn, owner, account["id"])
-                if any(o["status"] in ACTIVE or o["status"] == "draft" and demo_config is None for o in existing):
+                if any(o["status"] in ACTIVE or o["status"] == "waiting_market" or o["status"] == "draft" and demo_config is None for o in existing):
                     raise SandboxConflict("Сначала дождитесь результата текущей серии или остановите её.")
             snapshot = entry["client"].snapshot(account["id"])
             self.reconcile_positions(owner, account["id"], snapshot)
@@ -501,36 +512,33 @@ class SandboxService:
                 requests = [{"instrument_uid": payload.get("instrument_uid"), "lots": payload.get("lots"), "limit_price": payload.get("limit_price"), "direction": payload.get("direction", "buy")}]
             if not requests:
                 raise ValidationError("Доли в пределах правил или суммы недостаточно для целого лота.")
-            plans, skipped = [], []
+            plans = []
             projected = dict(snapshot)
             projected["positions"] = [dict(p) for p in snapshot["positions"]]
             for request in requests:
-                try:
-                    plan = entry["client"].preview_order(account["id"], request["instrument_uid"], request["lots"], request["limit_price"], request["direction"], quote_policy=policy["quote_policy"])
-                except SandboxError as exc:
-                    if demo_config is None or not rebalance or request["direction"] != "buy" or exc.code != "TRADING_CLOSED":
-                        raise
-                    skipped.append({"ticker": request.get("ticker"), "name": request.get("name"), "direction": request["direction"],
-                                    "amount": round(float(Decimal(str(request["limit_price"])) * Decimal(str(request.get("quantity", 0)))), 2),
-                                    "reason": "Торги по инструменту сейчас закрыты. Сумма остаётся в рублях; пересчитайте покупки, когда торги откроются."})
-                    continue
+                options = {"quote_policy": policy["quote_policy"]}
+                if demo_config is not None and rebalance and request["direction"] == "buy":
+                    options["allow_waiting"] = True
+                plan = entry["client"].preview_order(account["id"], request["instrument_uid"], request["lots"], request["limit_price"], request["direction"], **options)
                 self.check_allocation(policy, projected, plan)
                 plan["id"] = str(uuid.uuid4())
                 plans.append(plan)
                 if plan["direction"] == "buy":
                     projected["cash"] -= plan["estimated_total"]
-            if not plans:
-                names = ", ".join(item["ticker"] or "?" for item in skipped)
-                raise ValidationError("Торги по бумагам (" + names + ") сейчас закрыты, покупать пока нечего. Повторите расчёт, когда торги откроются.")
             total = round(sum(p["estimated_total"] for p in plans), 2)
-            skip_note = (" Не куплено из-за закрытых торгов: " + "; ".join(f"{s['ticker']} (≈ {s['amount']:,.0f} ₽ остаются в рублях)".replace(",", " ") for s in skipped) + ". Когда торги откроются, пересчитайте покупки.") if skipped else ""
+            has_waiting = any(p.get("waiting_market") for p in plans)
+            with self.store.transaction() as conn:
+                self.store.authenticate(conn, owner, key)
+                session_expiry = conn.execute("SELECT expires_at FROM sessions WHERE token_hash=? AND user_id=?", (key, owner)).fetchone()["expires_at"]
+            expiry = int(min(time.time() + (7 * 86400 if has_waiting else 600), session_expiry, datetime.fromisoformat(policy["expires_at"]).timestamp()))
+            expires_at = datetime.fromtimestamp(expiry, timezone.utc).isoformat(timespec="seconds")
             is_demo = policy.get("mode") == "demo"
             proposal = {"id": str(uuid.uuid4()), "account_id": account["id"], "policy_id": policy["id"], "profile_version": None if is_demo else data["profile_version"],
                         "orders": plans, "total": total, "commission": round(sum(p["commission"] for p in plans), 2), "commission_status": "known",
                         "reserve": policy["cash_reserve_percent"], "kind": "rebalance" if rebalance else "order", "created_at": now(),
-                        "expires_at": datetime.fromtimestamp(time.time() + 600, timezone.utc).isoformat(timespec="seconds"),
-                        "quote_policy": policy["quote_policy"], "skipped": skipped,
-                        "reason": "Приведение к долям стратегии «" + policy["name"] + "»." + skip_note if rebalance else "Операция в пределах подтверждённых правил.",
+                        "expires_at": expires_at, "waiting_until": expires_at if has_waiting else None,
+                        "quote_policy": policy["quote_policy"], "skipped": [],
+                        "reason": "Приведение к долям стратегии «" + policy["name"] + "»." if rebalance else "Операция в пределах подтверждённых правил.",
                         "source_snapshot": snapshot, "policy": policy, "profile": None if is_demo else self.profile(user, data),
                         "mode": "demo" if is_demo else "profile", "demo_config": data["demo_config"] if is_demo else None,
                         "config_version": data["demo_config_version"] if is_demo else None}
@@ -553,7 +561,7 @@ class SandboxService:
                         raise SandboxConflict("Правила изменились во время расчёта.")
                 self.invalidate(conn, owner, current, "proposal_replaced")
                 current.update(proposal_id=proposal["id"], snapshot=snapshot, catalog=catalog, checked_at=now(), reconcile_error=None)
-                conn.execute("INSERT INTO sandbox_proposals VALUES(?,?,?,?,?,NULL,0)", (proposal["id"], owner, account["id"], encode(proposal), time.time() + 600))
+                conn.execute("INSERT INTO sandbox_proposals VALUES(?,?,?,?,?,NULL,0)", (proposal["id"], owner, account["id"], encode(proposal), expiry))
                 self.store.save(conn, owner, current)
                 self.store.audit(conn, owner, "series_proposed", proposal)
                 conn.commit()
@@ -576,15 +584,26 @@ class SandboxService:
             with self.store.transaction() as conn:
                 self.store.order_result(conn, owner, order["id"], result)
                 conn.execute("UPDATE sandbox_proposals SET revoked=1 WHERE id=?", (order["proposal_id"],))
-                conn.execute("UPDATE sandbox_orders SET status='cancelled' WHERE proposal_id=? AND status='draft'", (order["proposal_id"],))
+                conn.execute("UPDATE sandbox_orders SET status='cancelled' WHERE proposal_id=? AND status IN ('draft','waiting_market')", (order["proposal_id"],))
         finally:
             self.vault.finish(entry)
         self.wake.set()
 
+    def expire_queues(self):
+        with self.store.transaction() as conn:
+            rows = conn.execute("SELECT p.id,p.user_id FROM sandbox_proposals p LEFT JOIN sandbox_consents c ON c.proposal_id=p.id LEFT JOIN sessions s ON s.token_hash=c.session_hash AND s.user_id=c.user_id WHERE p.confirmed_at IS NOT NULL AND (p.expires_at<=? OR (c.proposal_id IS NOT NULL AND (s.token_hash IS NULL OR s.expires_at<=? OR c.expires_at<=?)))", (time.time(), time.time(), time.time())).fetchall()
+            for row in rows:
+                pending = conn.execute("SELECT id,payload FROM sandbox_orders WHERE proposal_id=? AND status IN ('draft','waiting_market')", (row["id"],)).fetchall()
+                for order in pending:
+                    payload = {**json.loads(order["payload"]), "error": "Срок ожидания истёк или завершена сессия.", "updated_at": now()}
+                    conn.execute("UPDATE sandbox_orders SET status='cancelled',payload=? WHERE id=?", (encode(payload), order["id"]))
+                if pending:
+                    conn.execute("UPDATE sandbox_proposals SET revoked=1 WHERE id=?", (row["id"],))
+                    self.store.audit(conn, row["user_id"], "queue_expired", {"proposal_id": row["id"]})
+
     def dispatch(self, owner, key):
+        self.expire_queues()
         entry = self.vault.begin(owner, key, touch=False)
-        order = None
-        sending = False
         try:
             data, user = self.read(owner, key)
             if data["stopped"]:
@@ -596,31 +615,55 @@ class SandboxService:
                 orders = self.store.orders(conn, owner, account["id"])
                 if any(o["status"] in ACTIVE for o in orders):
                     return
-                order = next((o for o in sorted(orders, key=lambda o: (o["created_at"], o.get("sequence", 0))) if o["status"] == "draft"), None)
-                if not order:
+                candidates = [o for o in sorted(orders, key=lambda o: (o["created_at"], o.get("sequence", 0))) if o["status"] in PENDING and o.get("next_check_at", 0) <= time.time()]
+                for order in candidates:
+                    self.require_consent(conn, owner, key, order["proposal_id"])
+            for order in candidates:
+                if self.dispatch_order(owner, key, entry, account, policy, order):
                     return
+        finally:
+            self.vault.finish(entry)
+
+    def dispatch_order(self, owner, key, entry, account, policy, order):
+        sending = False
+        proposal = None
+        try:
+            with self.store.transaction() as conn:
+                data = self.store.load(conn, owner)
+                if data["stopped"]:
+                    return False
+                self.require_settled_actions(conn, owner)
+                self.require_consent(conn, owner, key, order["proposal_id"])
                 proposal = conn.execute("SELECT * FROM sandbox_proposals WHERE id=? AND user_id=?", (order["proposal_id"], owner)).fetchone()
                 if not proposal or not proposal["confirmed_at"] or proposal["revoked"] or proposal["expires_at"] <= time.time():
                     raise ValidationError("Согласие на оставшиеся операции больше не действует.")
                 self.approved_order(proposal, order, policy)
+                pending = [o for o in self.store.orders(conn, owner, account["id"]) if o["status"] in PENDING and o["direction"] == "buy"]
             snapshot = entry["client"].snapshot(account["id"])
             self.reconcile_positions(owner, account["id"], snapshot)
+            reserved = sum((Decimal(str(o["estimated_total"])) for o in pending), Decimal(0))
+            if reserved > Decimal(str(snapshot["cash"])):
+                raise ValidationError("Свободных рублей недостаточно для всех подтверждённых покупок. Нужен новый расчёт.")
             checked = entry["client"].preview_order(account["id"], order["instrument_uid"], order["lots"], order["limit_price"], order["direction"], quote_policy=policy["quote_policy"])
             self.check_allocation(policy, snapshot, checked)
             if checked["estimated_total"] > order["estimated_total"] + 0.01 or checked["commission"] > order["commission"] + 0.01:
                 raise ValidationError("Расходы выросли. Нужно новое предложение.")
+            if any(checked.get(field) != order.get(field) for field in ("instrument_uid", "ticker", "lot", "lots", "quantity", "limit_price", "direction", "notional")):
+                raise ValidationError("Цена, количество или инструмент изменились. Нужен новый расчёт.")
             @contextmanager
             def admission():
                 nonlocal sending
                 with self.lock(owner), self.store.transaction() as conn, self.vault.send_guard(entry):
                     user = self.store.authenticate(conn, owner, key)
                     self.require_settled_actions(conn, owner)
+                    self.require_consent(conn, owner, key, order["proposal_id"])
                     current = self.store.load(conn, owner)
                     current_policy = self.require_policy(current, user)
                     proposal = conn.execute("SELECT * FROM sandbox_proposals WHERE id=? AND user_id=?", (order["proposal_id"], owner)).fetchone()
                     row = conn.execute("SELECT * FROM sandbox_orders WHERE id=? AND user_id=?", (order["id"], owner)).fetchone()
-                    if current["stopped"] or current_policy["id"] != policy["id"] or not proposal or proposal["revoked"] or not proposal["confirmed_at"] or proposal["expires_at"] <= time.time() or not row or row["status"] != "draft":
-                        raise SandboxConflict("Отправка остановлена: согласие или правила изменились.")
+                    other_active = conn.execute("SELECT 1 FROM sandbox_orders WHERE user_id=? AND status IN ('submitting','new','partially_filled','unknown')", (owner,)).fetchone()
+                    if current["stopped"] or current_policy["id"] != policy["id"] or current["account"] != account or not proposal or proposal["revoked"] or not proposal["confirmed_at"] or proposal["expires_at"] <= time.time() or not row or row["status"] not in PENDING or other_active:
+                        raise SandboxConflict("Отправка остановлена: согласие, счёт или правила изменились.")
                     self.approved_order(proposal, {**json.loads(row["payload"]), "id": row["id"]}, current_policy)
                     if current.get("reconcile_error"):
                         raise SandboxConflict("Сначала выполните сверку счёта.")
@@ -628,7 +671,7 @@ class SandboxService:
                                     "config_version": current["demo_config_version"] if policy.get("mode") == "demo" else None, "policy_id": policy["id"],
                                     "account_id": account["id"], "consent": proposal["confirmed_at"], "checks": checked, "snapshot": snapshot,
                                     "environment": "sandbox", "margin": False})
-                    conn.execute("UPDATE sandbox_orders SET status='submitting' WHERE id=? AND status='draft'", (order["id"],))
+                    conn.execute("UPDATE sandbox_orders SET status='submitting' WHERE id=? AND status IN ('draft','waiting_market')", (order["id"],))
                     conn.commit()
                     sending = True
                     yield
@@ -639,23 +682,27 @@ class SandboxService:
                     self.refresh_pending.setdefault((owner, key), 3)
                 if result.get("status") in ("cancelled", "rejected"):
                     conn.execute("UPDATE sandbox_proposals SET revoked=1 WHERE id=?", (order["proposal_id"],))
-                    conn.execute("UPDATE sandbox_orders SET status='cancelled' WHERE proposal_id=? AND status='draft'", (order["proposal_id"],))
+                    conn.execute("UPDATE sandbox_orders SET status='cancelled' WHERE proposal_id=? AND status IN ('draft','waiting_market')", (order["proposal_id"],))
             self.last_refresh[(owner, key)] = 0
+            return True
         except (SandboxError, SandboxConflict, ValidationError) as exc:
-            if order:
-                with self.store.transaction() as conn:
-                    self.store.order_result(conn, owner, order["id"], {"status": "unknown" if sending else "blocked", "error": str(exc)})
-                    if not sending:
-                        conn.execute("UPDATE sandbox_proposals SET revoked=1 WHERE id=?", (order["proposal_id"],))
-                        conn.execute("UPDATE sandbox_orders SET status='cancelled' WHERE proposal_id=? AND status='draft'", (order["proposal_id"],))
+            queue = bool(proposal and json.loads(proposal["payload"]).get("waiting_until"))
+            retryable = bool(order.get("waiting_market") and queue and isinstance(exc, SandboxError) and exc.code in {"TRADING_CLOSED", "TIMEOUT", "NETWORK", "RATE_LIMIT", "REMOTE_ERROR", "INVALID_RESPONSE", "UNAVAILABLE", "TOO_LARGE"})
+            with self.store.transaction() as conn:
+                if not sending and retryable:
+                    self.store.order_result(conn, owner, order["id"], {"status": "waiting_market", "next_check_at": time.time() + 20, "last_wait_reason": str(exc), "wait_code": exc.code})
+                    return False
+                self.store.order_result(conn, owner, order["id"], {"status": "unknown" if sending else "blocked", "error": str(exc)})
+                if not sending:
+                    conn.execute("UPDATE sandbox_proposals SET revoked=1 WHERE id=?", (order["proposal_id"],))
+                    conn.execute("UPDATE sandbox_orders SET status='cancelled' WHERE proposal_id=? AND status IN ('draft','waiting_market')", (order["proposal_id"],))
             raise
-        finally:
-            self.vault.finish(entry)
 
     def run(self):
         while not self.closed.is_set():
             self.wake.wait(2)
             self.wake.clear()
+            self.expire_queues()
             with self.vault.lock:
                 entries = [(e["owner"], e["key"]) for e in self.vault.connections.values() if e["ready"] and e["account_id"] and not e["busy"]]
             for owner, key in entries:
@@ -664,6 +711,7 @@ class SandboxService:
                 self.tick(owner, key)
 
     def tick(self, owner, key):
+        self.expire_queues()
         try:
             data, user = self.read(owner, key)
             with self.store.transaction() as conn:
@@ -682,13 +730,13 @@ class SandboxService:
                 data, user = self.read(owner, key)
                 with self.store.transaction() as conn:
                     orders = self.store.orders(conn, owner, data["account"]["id"] if data["account"] else None)
-                if not data["stopped"] and data.get("policy") and data["policy"].get("mode") != "demo" and not any(o["status"] in ACTIVE or o["status"] == "draft" for o in orders):
+                if not data["stopped"] and data.get("policy") and data["policy"].get("mode") != "demo" and not any(o["status"] in ACTIVE or o["status"] in PENDING for o in orders):
                     with self.store.transaction() as conn:
                         proposal = conn.execute("SELECT * FROM sandbox_proposals WHERE id=? AND user_id=?", (data.get("proposal_id"), owner)).fetchone()
                     needs_proposal = not proposal or proposal["revoked"] or proposal["expires_at"] <= time.time() or bool(proposal["confirmed_at"])
                     if needs_proposal and rebalance_orders(data["policy"], data["snapshot"], data["catalog"]):
                         self.preview(owner, key, {}, True, background=True)
-            if not data["stopped"] and any(o["status"] == "draft" for o in orders):
+            if not data["stopped"] and any(o["status"] in PENDING for o in orders):
                 self.dispatch(owner, key)
         except Exception:
             identity = (owner, key)

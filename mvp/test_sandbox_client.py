@@ -40,7 +40,7 @@ class Transport:
         self.post_error = None
         self.order = None
         self.metadata = {}
-        for ticker, kind, class_code, lot, price, tick in (("SBER", "share", "TQBR", 10, 100, .01), ("LKOH", "share", "TQBR", 1, 7000, .5), ("TMOS", "etf", "TQTF", 1, 12.34, .001), ("TGLD", "etf", "TQTF", 1, 9.99, .01)):
+        for ticker, kind, class_code, lot, price, tick in (("SBER", "share", "TQBR", 10, 100, .01), ("LKOH", "share", "TQBR", 1, 7000, .5), ("TMOS", "etf", "TQTF", 1, 12.34, .001), ("TGLD", "etf", "TQTF", 1, 9.99, .01), ("TMON", "etf", "TQTF", 1, 166, .01)):
             uid = ticker.lower() + "-uid"
             self.metadata[uid] = {"uid": uid, "ticker": ticker, "name": "Инструмент " + ticker, "instrumentType": kind, "classCode": class_code, "lot": lot, "currency": "rub", "sector": "financial", "minPriceIncrement": quote(Decimal(str(tick))), "apiTradeAvailableFlag": True, "buyAvailableFlag": True, "sellAvailableFlag": True, "price": price}
 
@@ -143,14 +143,14 @@ class SandboxTests(unittest.TestCase):
 
     def test_catalog_uses_lots_steps_and_caches_only_metadata(self):
         first = self.client.catalog()
-        self.assertEqual(len(first), 4)
+        self.assertEqual(len(first), 5)
         self.assertEqual(first[0]["lot"], 10)
         self.assertEqual(first[0]["tick_size"], .01)
         self.assertEqual(first[-1]["asset_class"], "funds")
         self.assertEqual(first[-1]["sector"], "Фонды: состав не раскрыт")
         self.client.catalog()
         methods = [method for method, _ in self.transport.calls]
-        self.assertEqual(methods.count("InstrumentsService/FindInstrument"), 4)
+        self.assertEqual(methods.count("InstrumentsService/FindInstrument"), 5)
         self.assertEqual(methods.count("InstrumentsService/ShareBy"), 2)
         self.assertEqual(methods.count("MarketDataService/GetLastPrices"), 2)
         self.assertTrue(all(method in METHODS for method in methods))
@@ -257,6 +257,47 @@ class SandboxTests(unittest.TestCase):
                 self.assert_error("UNAVAILABLE", lambda: client.preview_order(ACCOUNT, "sber-uid", 1, 100))
                 status[field] = previous
         self.assertFalse(any(method.startswith("SandboxService/") for method, _ in self.transport.calls))
+
+    def test_closed_market_can_only_prepare_explicit_waiting_plan_with_known_fee(self):
+        original = self.transport.__call__
+        def transport(method, payload):
+            if method == "MarketDataService/GetTradingStatus":
+                return {"instrumentUid": payload["instrumentId"], "tradingStatus": "SECURITY_TRADING_STATUS_NOT_AVAILABLE_FOR_TRADING", "apiTradeAvailableFlag": True, "limitOrderAvailableFlag": False}
+            return original(method, payload)
+        client = SandboxClient(TOKEN, transport)
+        self.assert_error("TRADING_CLOSED", lambda: client.preview_order(ACCOUNT, "sber-uid", 1, 100, quote_policy="sandbox_last_close"))
+        self.assert_error("TRADING_CLOSED", lambda: client.preview_order(ACCOUNT, "sber-uid", 1, 100, allow_waiting=True))
+        plan = client.preview_order(ACCOUNT, "sber-uid", 1, 100, quote_policy="sandbox_last_close", allow_waiting=True)
+        self.assertTrue(plan["waiting_market"])
+        self.assertGreater(plan["commission"], 0)
+        self.assertEqual(plan["quantity"], 10)
+        self.assert_error("TRADING_CLOSED", lambda: client.place_order(ACCOUNT, plan, str(uuid.uuid4())))
+        self.assertFalse(any(method == "SandboxService/PostSandboxOrder" for method, _ in self.transport.calls))
+        self.transport.missing_commission = True
+        self.assert_error("INVALID_RESPONSE", lambda: client.preview_order(ACCOUNT, "sber-uid", 1, 100, quote_policy="sandbox_last_close", allow_waiting=True))
+
+    def test_waiting_does_not_bypass_unknown_or_forbidden_status(self):
+        original = self.transport.__call__
+        for changes in ({"apiTradeAvailableFlag": False}, {"limitOrderAvailableFlag": None}, {"limitOrderAvailableFlag": "false"}, {"instrumentUid": "wrong"}, {"tradingStatus": "SECURITY_TRADING_STATUS_UNSPECIFIED"}, {"onlyBestPrice": True}):
+            def transport(method, payload):
+                if method == "MarketDataService/GetTradingStatus":
+                    return {"instrumentUid": payload["instrumentId"], "tradingStatus": "SECURITY_TRADING_STATUS_NOT_AVAILABLE_FOR_TRADING", "apiTradeAvailableFlag": True, "limitOrderAvailableFlag": False, **changes}
+                return original(method, payload)
+            client = SandboxClient(TOKEN, transport)
+            with self.subTest(changes=changes):
+                self.assert_error("UNAVAILABLE", lambda: client.preview_order(ACCOUNT, "sber-uid", 1, 100, quote_policy="sandbox_last_close", allow_waiting=True))
+
+    def test_tmon_approved_alias_is_canonical_and_other_suffix_is_not_accepted(self):
+        self.transport.metadata["tmon-uid"].update(ticker="TMON@", classCode="SPBRU")
+        item = next(row for row in self.client.catalog() if row["ticker"] == "TMON")
+        self.assertTrue(item["available"])
+        self.assertEqual(item["broker_ticker"], "TMON@")
+        self.assertEqual(item["asset_class"], "funds")
+        plan = self.client.preview_order(ACCOUNT, "tmon-uid", 1, 166)
+        self.assertEqual(plan["quantity"], 1)
+        self.transport.metadata["tmon-uid"].update(ticker="TMON@@")
+        item = next(row for row in SandboxClient(TOKEN, self.transport).catalog() if row["ticker"] == "TMON")
+        self.assertFalse(item["available"])
 
     def test_post_order_is_limit_with_saved_uuid_and_never_retries(self):
         plan = self.client.preview_order(ACCOUNT, "sber-uid", 2, 100)

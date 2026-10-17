@@ -45,7 +45,7 @@ class FakeSandbox:
                               "asset_class": "stocks" if ticker in ("SBER", "LKOH") else "funds",
                               "sector": "Финансы" if ticker == "SBER" else "Фонды: состав не раскрыт",
                               "lot": lot, "tick_size": .01, "price": price, "available": True}
-                             for ticker, lot, price in (("SBER", 10, 100), ("LKOH", 1, 1000), ("TMOS", 1, 10), ("TGLD", 1, 100))]
+                             for ticker, lot, price in (("SBER", 10, 100), ("LKOH", 1, 1000), ("TMOS", 1, 10), ("TGLD", 1, 100), ("TMON", 1, 100))]
 
     def accounts(self):
         return copy.deepcopy(self.account_rows)
@@ -79,7 +79,7 @@ class FakeSandbox:
     def catalog(self):
         return copy.deepcopy(self.catalog_rows)
 
-    def preview_order(self, account_id, instrument_uid, lots, limit_price, direction="buy", quote_policy="strict_30s"):
+    def preview_order(self, account_id, instrument_uid, lots, limit_price, direction="buy", quote_policy="strict_30s", allow_waiting=False):
         if self.precheck_hook:
             self.precheck_hook()
         item = next((row for row in self.catalog_rows if row["instrument_uid"] == instrument_uid), None)
@@ -344,62 +344,52 @@ class SandboxServiceTests(unittest.TestCase):
         cards = self.public()["demo_strategies"]
         self.assertEqual([(card["id"], card["name"], card["risk_level"]) for card in cards],
                          [("reserve", "Осторожный", 1), ("moderate", "Умеренный", 2), ("balanced", "Сбалансированный", 3), ("growth", "Динамичный", 4)])
-        self.assertEqual([card["weights"]["RUB"] for card in cards], [85, 60, 40, 10])
+        self.assertEqual([card["weights"]["TMON"] for card in cards], [85, 60, 40, 10])
         self.assertTrue(all(sum(card["weights"].values()) == 100 for card in cards))
-        self.assertTrue(all(set(card["weights"]) <= {"RUB", "TGLD", "TMOS", "SBER", "LKOH"} for card in cards))
+        self.assertTrue(all(set(card["weights"]) <= {"RUB", "TMON", "TGLD", "TMOS", "SBER", "LKOH"} for card in cards))
 
     def gold_preview(self, code):
         original = self.actor["fake"].preview_order
         def preview(account_id, instrument_uid, *args, **kwargs):
             if instrument_uid == "tgld-uid":
+                if code == "TRADING_CLOSED" and kwargs.get("allow_waiting"):
+                    return {**original(account_id, instrument_uid, *args, **kwargs), "waiting_market": True, "waiting_reason": "Торги закрыты"}
                 raise SandboxError(code)
             return original(account_id, instrument_uid, *args, **kwargs)
         return patch.object(self.actor["fake"], "preview_order", side_effect=preview)
 
-    def test_closed_gold_fund_does_not_block_the_rest_of_the_basket(self):
+    def test_closed_gold_is_in_the_exact_confirmed_queue(self):
         self.action("connect", {"token": self.actor["secret"]})
         self.action("create", {"key": str(uuid.uuid4())})
+        fake = self.actor["fake"]
         with self.gold_preview("TRADING_CLOSED"):
             proposal = self.demo_preview("balanced")
-        self.assertEqual({row["ticker"] for row in proposal["orders"]}, {"TMOS", "SBER", "LKOH"})
-        self.assertEqual([item["ticker"] for item in proposal["skipped"]], ["TGLD"])
-        self.assertGreater(proposal["skipped"][0]["amount"], 0)
-        self.assertIn("TGLD", proposal["reason"])
-        self.assertIn("остаются в рублях", proposal["reason"])
-        self.confirm(proposal)
-        self.dispatch()
-        self.assertEqual(self.actor["fake"].posts, [proposal["orders"][0]["id"]])
-
-    def test_partial_purchase_reopens_on_same_account_with_new_consent(self):
-        fake = self.actor["fake"]
-        self.action("connect", {"token": self.actor["secret"]})
-        self.action("create", {"key": str(uuid.uuid4())})
-        with self.gold_preview("TRADING_CLOSED"):
-            proposal = self.demo_preview()
+            waiting = [order for order in proposal["orders"] if order.get("waiting_market")]
+            self.assertEqual([order["ticker"] for order in waiting], ["TGLD"])
+            self.assertEqual({order["ticker"] for order in proposal["orders"]}, {"TMON", "TGLD", "TMOS", "SBER", "LKOH"})
+            self.assertEqual(fake.posts, [])
             self.confirm(proposal)
-            for order in proposal["orders"]:
+            self.assertTrue(any(order["status"] == "waiting_market" for order in self.public()["orders"]))
+            for _ in range(5):
                 self.dispatch()
-                fake.fill(order["id"])
+                for request_id in fake.posts:
+                    fake.fill(request_id)
                 self.action("refresh")
-            self.assertTrue(self.public()["snapshot_reconciled"])
-            self.assertEqual(len(fake.positions), 3)
-            self.assertGreater(fake.cash, 6_000_000)
-            with self.assertRaises(ValidationError):
+            self.assertEqual(len(fake.posts), 4)
+            self.assertNotIn(waiting[0]["id"], fake.posts)
+            self.assertLess(fake.cash, 2_200_000)
+            self.assertGreater(fake.cash, 1_900_000)
+            with self.assertRaises(SandboxConflict):
                 self.demo_preview()
-            self.assertEqual(self.public()["proposal"]["id"], proposal["id"])
-        reopened = self.demo_preview()
-        self.assertEqual([o["ticker"] for o in reopened["orders"]], ["TGLD"])
-        self.assertEqual(reopened["skipped"], [])
-        self.assertEqual(reopened["account_id"], proposal["account_id"])
-        self.dispatch()
-        self.assertEqual(len(fake.posts), 3)
-        with self.assertRaises(ValidationError):
-            self.confirm(proposal)
-        self.confirm(reopened)
-        self.dispatch()
-        fake.fill(reopened["orders"][0]["id"])
+        for key in list(self.service.last_refresh):
+            self.service.last_refresh[key] = 0
+        with patch("sandbox_service.time.time", return_value=time.time() + 21):
+            self.dispatch()
+        self.assertEqual(len(fake.posts), 5)
+        self.assertEqual(fake.posts[-1], waiting[0]["id"])
+        fake.fill(waiting[0]["id"])
         self.action("refresh")
-        self.assertEqual(len(fake.positions), 4)
+        self.assertEqual(len(fake.positions), 5)
         self.assertEqual(fake.open_calls, 1)
         self.assertEqual(fake.payments, [10_000_000])
         self.assertTrue(self.public()["snapshot_reconciled"])
@@ -420,28 +410,29 @@ class SandboxServiceTests(unittest.TestCase):
         self.assertIsNone(self.public()["demo_config"])
         self.assertEqual(fake.posts, [])
 
-    def test_closing_after_consent_does_not_silently_change_the_series(self):
-        proposal = self.demo_ready()
-        self.confirm(proposal)
-        with self.gold_preview("TRADING_CLOSED"):
-            with self.assertRaises(SandboxError):
-                self.dispatch()
-        self.assertEqual(self.actor["fake"].posts, [])
-        self.assertFalse(any(o["status"] == "draft" for o in self.public()["orders"]))
-
     def test_open_trading_has_no_skipped_instruments(self):
         proposal = self.demo_ready("balanced")
         self.assertEqual(proposal["skipped"], [])
-        self.assertEqual({row["ticker"] for row in proposal["orders"]}, {"TGLD", "TMOS", "SBER", "LKOH"})
+        self.assertEqual({row["ticker"] for row in proposal["orders"]}, {"TGLD", "TMOS", "SBER", "LKOH", "TMON"})
 
-    def test_basket_with_only_closed_instruments_explains_why_nothing_is_bought(self):
+    def test_basket_with_only_closed_instruments_waits_without_posting(self):
         self.action("connect", {"token": self.actor["secret"]})
         self.action("create", {"key": str(uuid.uuid4())})
-        with self.gold_preview("TRADING_CLOSED"):
-            with self.assertRaises(ValidationError) as caught:
-                self.demo_preview("reserve")
-        self.assertIn("TGLD", str(caught.exception))
-        self.assertIsNone(self.public()["proposal"])
+        fake = self.actor["fake"]
+        original = fake.preview_order
+        def closed(*args, **kwargs):
+            if kwargs.get("allow_waiting"):
+                return {**original(*args, **kwargs), "waiting_market": True, "waiting_reason": "Торги закрыты"}
+            raise SandboxError("TRADING_CLOSED")
+        with patch.object(fake, "preview_order", side_effect=closed):
+            proposal = self.demo_preview("reserve")
+            self.assertEqual(len(proposal["orders"]), 2)
+            self.assertTrue(all(order.get("waiting_market") for order in proposal["orders"]))
+            self.confirm(proposal)
+            self.dispatch()
+        self.assertEqual(fake.posts, [])
+        self.assertEqual(fake.cash, 10_000_000)
+        self.assertTrue(all(order["status"] == "waiting_market" for order in self.public()["orders"]))
 
     def test_other_unavailable_reasons_still_block_the_basket(self):
         self.action("connect", {"token": self.actor["secret"]})
@@ -487,8 +478,8 @@ class SandboxServiceTests(unittest.TestCase):
         self.assertGreater(current["config_version"], previous["config_version"])
         self.assertGreater(current["policy"]["version"], previous["policy"]["version"])
         self.assertNotEqual(current["fingerprint"], previous["fingerprint"])
-        self.assertEqual(current["policy"]["weights"]["RUB"], 85)
-        self.assertEqual({row["ticker"] for row in current["orders"]}, {"TGLD"})
+        self.assertEqual(current["policy"]["weights"]["TMON"], 85)
+        self.assertEqual({row["ticker"] for row in current["orders"]}, {"TMON", "TGLD"})
         with self.assertRaises(ValidationError):
             self.confirm(previous)
         self.dispatch()
@@ -768,10 +759,14 @@ class SandboxServiceTests(unittest.TestCase):
     def test_final_fill_refreshes_snapshot_with_short_bounded_retries(self):
         proposal = self.demo_ready("reserve")
         self.confirm(proposal)
+        for order in proposal["orders"][:-1]:
+            self.dispatch()
+            self.actor["fake"].fill(order["id"])
+            self.action("refresh")
         self.dispatch()
         fake = self.actor["fake"]
         old_snapshot = fake.snapshot(proposal["account_id"])
-        fake.fill(fake.posts[0])
+        fake.fill(fake.posts[-1])
         identity = (self.actor["owner"], self.actor["key"])
         self.service.last_refresh[identity] = time.monotonic() - 11
         with patch.object(fake, "snapshot", return_value=old_snapshot) as snapshot:
@@ -789,15 +784,19 @@ class SandboxServiceTests(unittest.TestCase):
         self.assertEqual(current["snapshot"]["cash"], fake.cash)
         self.assertEqual(current["proposal"]["id"], proposal["id"])
         self.assertNotIn(identity, self.service.refresh_pending)
-        self.assertEqual(fake.posts, [proposal["orders"][0]["id"]])
+        self.assertEqual(fake.posts, [order["id"] for order in proposal["orders"]])
 
     def test_final_fill_does_not_poll_forever_if_snapshot_keeps_lagging(self):
         proposal = self.demo_ready("reserve")
         self.confirm(proposal)
+        for order in proposal["orders"][:-1]:
+            self.dispatch()
+            self.actor["fake"].fill(order["id"])
+            self.action("refresh")
         self.dispatch()
         fake = self.actor["fake"]
         lagging = fake.snapshot(proposal["account_id"])
-        fake.fill(fake.posts[0])
+        fake.fill(fake.posts[-1])
         identity = (self.actor["owner"], self.actor["key"])
         self.service.last_refresh[identity] = time.monotonic() - 11
         with patch.object(fake, "snapshot", return_value=lagging) as snapshot:
@@ -808,18 +807,18 @@ class SandboxServiceTests(unittest.TestCase):
             self.assertEqual(snapshot.call_count, 3)
         self.assertNotIn(identity, self.service.refresh_pending)
         self.assertTrue(self.public()["reconcile_error"])
-        self.assertEqual(len(fake.posts), 1)
+        self.assertEqual(len(fake.posts), len(proposal["orders"]))
 
-    def test_same_second_snapshot_with_three_positions_is_not_reconciled_with_four_fills(self):
+    def test_same_second_snapshot_with_four_positions_is_not_reconciled_with_five_fills(self):
         proposal = self.demo_ready()
         self.confirm(proposal)
         fake = self.actor["fake"]
-        for _ in range(3):
+        for _ in range(4):
             self.dispatch()
             fake.fill(fake.posts[-1])
             self.action("refresh")
         before = self.public()["snapshot"]
-        self.assertEqual(len(before["positions"]), 3)
+        self.assertEqual(len(before["positions"]), 4)
         self.dispatch()
         last = fake.posts[-1]
         fake.fill(last)
@@ -830,19 +829,23 @@ class SandboxServiceTests(unittest.TestCase):
             order["updated_at"] = before["fetched_at"]
             conn.execute("UPDATE sandbox_orders SET payload=? WHERE id=?", (encode(order), last))
         current = self.public()
-        self.assertEqual(len(current["snapshot"]["positions"]), 3)
+        self.assertEqual(len(current["snapshot"]["positions"]), 4)
         self.assertTrue(all(row["status"] == "filled" for row in current["orders"]))
         self.assertFalse(current["snapshot_reconciled"])
         self.action("refresh")
         self.assertTrue(self.public()["snapshot_reconciled"])
-        self.assertEqual(len(self.public()["snapshot"]["positions"]), 4)
-        self.assertEqual(len(fake.posts), 4)
+        self.assertEqual(len(self.public()["snapshot"]["positions"]), 5)
+        self.assertEqual(len(fake.posts), 5)
 
     def test_expired_confirmed_proposal_still_serves_reconciled_positions(self):
         proposal = self.demo_ready("reserve")
         self.confirm(proposal)
+        for order in proposal["orders"][:-1]:
+            self.dispatch()
+            self.actor["fake"].fill(order["id"])
+            self.action("refresh")
         self.dispatch()
-        self.actor["fake"].fill(self.actor["fake"].posts[0])
+        self.actor["fake"].fill(self.actor["fake"].posts[-1])
         self.action("refresh")
         with patch("sandbox_service.time.time", return_value=time.time() + 601):
             state = self.public()
@@ -987,7 +990,7 @@ class SandboxServiceTests(unittest.TestCase):
         fake.cash = 4_000_000
         fake.positions = [{**fake.catalog_rows[2], "quantity": 600_000, "price": 10, "currency": "RUB", "blocked": False, "available_quantity": 600_000}]
         with self.assertRaises(ValidationError):
-            self.action("preview", {"instrument_uid": "sber-uid", "lots": 1000, "limit_price": 100, "direction": "buy"})
+            self.action("preview", {"instrument_uid": "sber-uid", "lots": 2000, "limit_price": 100, "direction": "buy"})
         self.assertEqual(fake.posts, [])
 
     def test_policy_change_revokes_old_proposal_and_versions_rules(self):
@@ -1336,7 +1339,7 @@ class PortfolioPolicyTests(unittest.TestCase):
     def test_rules_expire_after_thirty_days_and_keep_explicit_reserve(self):
         policy = make_policy(self.profile(), "balanced", "sandbox-account", 1)
         self.assertEqual(datetime.fromisoformat(policy["expires_at"]) - datetime.fromisoformat(policy["created_at"]), timedelta(days=30))
-        self.assertEqual(policy["cash_reserve_percent"], 40)
+        self.assertEqual(policy["cash_reserve_percent"], 0)
         self.assertEqual(sum(policy["weights"].values()), 100)
         self.assertEqual(policy["environment"], "sandbox")
 
@@ -1346,7 +1349,7 @@ class PortfolioPolicyTests(unittest.TestCase):
         for changes in ({"risk_tolerance": "medium"}, {"experience": "none", "risk_tolerance": "high"}, {"loss_reaction": "sell", "risk_tolerance": "high"}, {"horizon_years": 4, "risk_tolerance": "high"}):
             with self.assertRaises(ValidationError):
                 make_policy(self.profile(**changes), "growth", "sandbox-account", 1)
-        self.assertEqual(make_policy(self.profile(risk_tolerance="high"), "growth", "sandbox-account", 1)["cash_reserve_percent"], 10)
+        self.assertEqual(make_policy(self.profile(risk_tolerance="high"), "growth", "sandbox-account", 1)["cash_reserve_percent"], 0)
 
     def test_rebalancing_uses_whole_lots_and_preserves_target_cash(self):
         fake = FakeSandbox("unused-fixture-secret")
@@ -1354,9 +1357,9 @@ class PortfolioPolicyTests(unittest.TestCase):
         snapshot = {"positions": [], "cash": 10_000_000, "total_value": 10_000_000}
         requests = rebalance_orders(policy, snapshot, fake.catalog())
         cost = sum(Decimal(str(row["limit_price"])) * row["quantity"] * Decimal("1.0055") for row in requests)
-        self.assertLessEqual(cost, Decimal(6_000_000))
+        self.assertLessEqual(cost, Decimal(10_000_000))
         self.assertTrue(all(row["quantity"] == row["lots"] * row["lot"] and isinstance(row["lots"], int) for row in requests))
-        self.assertEqual({row["ticker"] for row in requests}, {"SBER", "LKOH", "TMOS", "TGLD"})
+        self.assertEqual({row["ticker"] for row in requests}, {"SBER", "LKOH", "TMOS", "TGLD", "TMON"})
 
     def test_demo_policy_liquidates_only_known_positions_without_fabricated_profile(self):
         config = validate_demo_config({"strategy_id": "reserve", "goal_name": "Цель", "target_amount": 10_000_000,

@@ -19,10 +19,11 @@ from tinvest import NoRedirect, TInvestError, integer, label, quotation
 BASE_URL = "https://sandbox-invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1."
 METHODS = frozenset({"SandboxService/" + name for name in ("GetSandboxAccounts", "OpenSandboxAccount", "SandboxPayIn", "GetSandboxPortfolio", "GetSandboxPositions", "GetSandboxOrders", "PostSandboxOrder", "GetSandboxOrderState", "CancelSandboxOrder", "GetSandboxOrderPrice")} | {"InstrumentsService/" + name for name in ("FindInstrument", "ShareBy", "EtfBy")} | {"MarketDataService/" + name for name in ("GetLastPrices", "GetTradingStatus", "GetOrderBook")})
 RESPONSE_LIMIT = 2 * 1024 * 1024
-WATCHLIST = (("SBER", "share", "TQBR"), ("LKOH", "share", "TQBR"), ("TMOS", "etf", "TQTF"), ("TGLD", "etf", "TQTF"))
+WATCHLIST = (("SBER", "share", "TQBR"), ("LKOH", "share", "TQBR"), ("TMOS", "etf", "TQTF"), ("TGLD", "etf", "TQTF"), ("TMON", "etf", "TQTF"))
 INSTRUMENT_PAIRS = {"SBER": (("SBER", "TQBR"),), "LKOH": (("LKOH", "TQBR"),),
                     "TMOS": (("TMOS", "TQTF"), ("TMOS@", "SPBRU")),
-                    "TGLD": (("TGLD", "TQTF"), ("TGLD@", "SPBRU"))}
+                    "TGLD": (("TGLD", "TQTF"), ("TGLD@", "SPBRU")),
+                    "TMON": (("TMON", "TQTF"), ("TMON@", "SPBRU"))}
 MESSAGES = {
     "INVALID_TOKEN": "Введите токен песочницы без пробелов и переносов строк.",
     "INVALID_RESPONSE": "Песочница вернула неполные или некорректные данные.",
@@ -362,14 +363,14 @@ class SandboxClient:
         return result
 
     @bounded
-    def preview_order(self, account_id, instrument_uid, lots, limit_price, direction="buy", quote_policy="strict_30s"):
+    def preview_order(self, account_id, instrument_uid, lots, limit_price, direction="buy", quote_policy="strict_30s", allow_waiting=False):
         if isinstance(lots, bool) or not isinstance(lots, int) or not 1 <= lots <= 1_000_000 or direction not in ("buy", "sell"):
             raise SandboxError("INVALID_ORDER")
         price = numeric(limit_price)
         instrument = next((row for row in self.catalog() if row["instrument_uid"] == instrument_uid), None)
         if not instrument or not instrument["available"] or not instrument["can_" + direction]:
             raise SandboxError("UNAVAILABLE")
-        if quote_policy not in ("strict_30s", "sandbox_last_close"):
+        if quote_policy not in ("strict_30s", "sandbox_last_close") or not isinstance(allow_waiting, bool):
             raise SandboxError("INVALID_ORDER")
         try:
             source_time = datetime.fromisoformat(instrument["price_time"].replace("Z", "+00:00"))
@@ -385,9 +386,10 @@ class SandboxClient:
         status = self._call("MarketDataService/GetTradingStatus", {"instrumentId": instrument_uid})
         if status.get("instrumentUid") != instrument_uid:
             raise SandboxError("UNAVAILABLE", "Выставление лимитных заявок сейчас недоступно.")
-        if status.get("apiTradeAvailableFlag") is True and status.get("limitOrderAvailableFlag") is False and status.get("tradingStatus") == "SECURITY_TRADING_STATUS_NOT_AVAILABLE_FOR_TRADING":
+        waiting = status.get("apiTradeAvailableFlag") is True and status.get("limitOrderAvailableFlag") is False and status.get("tradingStatus") == "SECURITY_TRADING_STATUS_NOT_AVAILABLE_FOR_TRADING"
+        if waiting and not (allow_waiting and direction == "buy" and quote_policy == "sandbox_last_close"):
             raise SandboxError("TRADING_CLOSED", instrument["ticker"] + ": пересчитайте покупки после открытия торгов.")
-        if status.get("apiTradeAvailableFlag") is not True or status.get("limitOrderAvailableFlag") is not True:
+        if status.get("apiTradeAvailableFlag") is not True or (status.get("limitOrderAvailableFlag") is not True and not waiting) or status.get("onlyBestPrice") is True:
             raise SandboxError("UNAVAILABLE", instrument["ticker"] + ": лимитные заявки сейчас недоступны.")
         book = self._call("MarketDataService/GetOrderBook", {"instrumentId": instrument_uid, "depth": 1})
         if book.get("instrumentUid") != instrument_uid or str(book.get("priceCurrency", "")).upper() != "RUB":
@@ -419,7 +421,7 @@ class SandboxClient:
             position = next((row for row in snapshot["positions"] if row["instrument_uid"] == instrument_uid), None)
             if not position or position["blocked"] or quantity > position["available_quantity"]:
                 raise SandboxError("INSUFFICIENT_POSITION")
-        return {"instrument_uid": instrument_uid, "ticker": instrument["ticker"], "name": instrument["name"], "lot": instrument["lot"], "lots": lots, "quantity": quantity, "limit_price": float(price), "direction": direction, "notional": float(notional), "cash": snapshot["cash"], "buffer": float(buffer), "commission": float(commission), "broker_total": float(broker_total), "estimated_total": float(estimated), "quote_policy": quote_policy, "quote_age_seconds": round(quote_age, 1), "price_time": instrument["price_time"], "warnings": ["Песочница: допускается последняя цена закрытого рынка; требование свежести 30 секунд не выполнено."] if quote_policy == "sandbox_last_close" and quote_age > 30 else []}
+        return {"instrument_uid": instrument_uid, "ticker": instrument["ticker"], "name": instrument["name"], "lot": instrument["lot"], "lots": lots, "quantity": quantity, "limit_price": float(price), "direction": direction, "notional": float(notional), "cash": snapshot["cash"], "buffer": float(buffer), "commission": float(commission), "broker_total": float(broker_total), "estimated_total": float(estimated), "quote_policy": quote_policy, "quote_age_seconds": round(quote_age, 1), "price_time": instrument["price_time"], "waiting_market": waiting, "waiting_reason": "Торги закрыты; заявка будет отправлена после открытия с указанными ценой и количеством." if waiting else "", "warnings": ["Песочница: допускается последняя цена закрытого рынка; требование свежести 30 секунд не выполнено."] if quote_policy == "sandbox_last_close" and quote_age > 30 else []}
 
     @bounded
     def place_order(self, account_id, plan, order_id, before_send=None):

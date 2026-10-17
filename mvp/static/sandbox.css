@@ -170,3 +170,10 @@
 .sb-payment>div>b {max-width:65%;text-align:right;line-height:1.5}
 .sb-purchase-name>span,.sb-purchase-value>span {font-size:10px;line-height:1.65}
 .sb-review-heading h2,.sb-result-goal h3 {overflow-wrap:anywhere}
+
+.sb-market-notice{margin:16px 0;padding:16px 20px;border-radius:14px;background:#f6efdc;color:#4a3d16;font-size:14px;line-height:1.5}
+.sb-market-notice b{display:block}
+.sb-market-notice p{margin:6px 0}
+.sb-market-notice small{display:block;color:#716748;font-size:12px}
+.sb-market-notice button{margin:8px 0}
+.sb-purchase-list h3{margin:16px 0 6px;font-size:14px;color:#66745e}

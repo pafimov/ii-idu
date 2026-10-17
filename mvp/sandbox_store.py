@@ -47,6 +47,11 @@ def initialize(conn):
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS sandbox_consents (
+            proposal_id TEXT PRIMARY KEY REFERENCES sandbox_proposals(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            session_hash TEXT NOT NULL, expires_at REAL NOT NULL
+        );
     ''')
 
 

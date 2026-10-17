@@ -5,11 +5,14 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from engine import ValidationError, number, text
 
 
+STRATEGY_VERSION = 2
+
+
 STRATEGIES = (
-    {"id": "reserve", "name": "Осторожный", "risk_level": 1, "description": "85% в рублях, 15% в фонде золота. Небольшая доля вложений может колебаться.", "weights": {"RUB": 85, "TGLD": 15}},
-    {"id": "moderate", "name": "Умеренный", "risk_level": 2, "description": "60% в рублях, остальное в фондах и акциях. Больше вложений и больше колебаний.", "weights": {"RUB": 60, "TGLD": 20, "TMOS": 10, "SBER": 5, "LKOH": 5}},
-    {"id": "balanced", "name": "Сбалансированный", "risk_level": 3, "description": "40% в рублях, 60% в фондах и российских акциях. Стоимость вложений может заметно меняться.", "weights": {"RUB": 40, "TGLD": 20, "TMOS": 25, "SBER": 10, "LKOH": 5}},
-    {"id": "growth", "name": "Динамичный", "risk_level": 4, "description": "10% в рублях, большая часть в фондах и акциях. Возможны сильные колебания стоимости.", "weights": {"RUB": 10, "TGLD": 20, "TMOS": 35, "SBER": 20, "LKOH": 15}},
+    {"id": "reserve", "name": "Осторожный", "risk_level": 1, "description": "85% в фонде денежного рынка TMON, 15% в фонде золота. Небольшая доля вложений может колебаться.", "weights": {"RUB": 0, "TMON": 85, "TGLD": 15}},
+    {"id": "moderate", "name": "Умеренный", "risk_level": 2, "description": "60% в денежном рынке TMON, остальное в фондах и акциях. Больше вложений и больше колебаний.", "weights": {"RUB": 0, "TMON": 60, "TGLD": 20, "TMOS": 10, "SBER": 5, "LKOH": 5}},
+    {"id": "balanced", "name": "Сбалансированный", "risk_level": 3, "description": "40% в денежном рынке TMON, 60% в фондах и российских акциях. Стоимость вложений может заметно меняться.", "weights": {"RUB": 0, "TMON": 40, "TGLD": 20, "TMOS": 25, "SBER": 10, "LKOH": 5}},
+    {"id": "growth", "name": "Динамичный", "risk_level": 4, "description": "10% в денежном рынке TMON, большая часть в фондах и акциях. Возможны сильные колебания стоимости.", "weights": {"RUB": 0, "TMON": 10, "TGLD": 20, "TMOS": 35, "SBER": 20, "LKOH": 15}},
 )
 
 
@@ -55,9 +58,9 @@ def validate_demo_config(data):
 def make_demo_policy(config, account_id, version, config_version):
     strategy = next(strategy for strategy in STRATEGIES if strategy["id"] == config["strategy_id"])
     created = utcnow()
-    weights = {ticker: strategy["weights"].get(ticker, 0) for ticker in ("RUB", "TGLD", "TMOS", "SBER", "LKOH")}
+    weights = {ticker: strategy["weights"].get(ticker, 0) for ticker in ("RUB", "TMON", "TGLD", "TMOS", "SBER", "LKOH")}
     return {**strategy, "weights": weights, "id": str(uuid.uuid4()), "strategy_id": strategy["id"],
-            "mode": "demo", "config_version": config_version, "demo_config": dict(config), "version": version,
+            "mode": "demo", "basket_version": STRATEGY_VERSION, "config_version": config_version, "demo_config": dict(config), "version": version,
             "account_id": account_id, "cash_reserve_percent": strategy["weights"]["RUB"], "rebalance_threshold": 5,
             "max_weights": {ticker: min(100, weight + 5) if weight else 0 for ticker, weight in weights.items() if ticker != "RUB"},
             "created_at": created.isoformat(timespec="seconds"), "expires_at": (created + timedelta(days=30)).isoformat(timespec="seconds"),
@@ -73,7 +76,7 @@ def make_policy(profile, strategy_id, account_id, version):
         raise ValidationError(reason)
     created = utcnow()
     return {**strategy, "id": str(uuid.uuid4()), "strategy_id": strategy_id, "account_id": account_id,
-            "version": version, "profile_version": profile["version"], "profile": dict(profile),
+            "version": version, "basket_version": STRATEGY_VERSION, "profile_version": profile["version"], "profile": dict(profile),
             "cash_reserve_percent": strategy["weights"]["RUB"], "rebalance_threshold": 5,
             "max_weights": {ticker: min(100, weight + 5) for ticker, weight in strategy["weights"].items() if ticker != "RUB"},
             "created_at": created.isoformat(timespec="seconds"),
@@ -136,7 +139,7 @@ def insights(snapshot, policy):
         share = largest["quantity"] * largest["price"] / total * 100
         result.append({"title": "Крупнейшая позиция — " + largest["ticker"], "text": f"{share:.1f}% стоимости счёта. Состав фондов здесь не раскрывается."})
     cash_share = snapshot.get("cash", 0) / total * 100
-    cash_text = "Это деньги внутри портфеля; их целевая доля задана выбранной стратегией." if policy and policy.get("mode") == "demo" else "Это деньги внутри портфеля; резерв из вашего профиля считается отдельно."
+    cash_text = "Остаток на комиссии, округление лотов и покупки в ожидании. Денежный рынок TMON учитывается отдельно как фонд." if policy and policy.get("mode") == "demo" else "Это деньги внутри портфеля; резерв из вашего профиля считается отдельно."
     result.append({"title": f"В рублях — {cash_share:.1f}%", "text": cash_text})
     if policy:
         deviations = []
